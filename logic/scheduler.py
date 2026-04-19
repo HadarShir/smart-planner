@@ -1,0 +1,431 @@
+from db.database import get_study_blocks, get_workouts, get_preferences, get_tasks, get_task_sessions
+
+DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+DAY_START_MIN = 8 * 60   # 08:00
+DAY_END_MIN   = 22 * 60  # 22:00
+
+# Max task-work minutes we'll schedule in a single day
+MAX_TASK_MIN_PER_DAY = 3 * 60  # 3 hours
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def hhmm_to_min(hhmm: str) -> int:
+    h, m = map(int, hhmm.split(":"))
+    return h * 60 + m
+
+
+def min_to_hhmm(minutes: int) -> str:
+    h = minutes // 60
+    m = minutes % 60
+    return f"{h:02d}:{m:02d}"
+
+
+def get_all_events_by_day(user_id: int) -> dict:
+    """Return a dict {day_of_week: [event_dicts]} including study blocks, workouts,
+    and already-accepted task sessions so the scheduler never double-books them."""
+    study_blocks  = get_study_blocks(user_id)
+    workouts      = get_workouts(user_id)
+    task_sessions = get_task_sessions(user_id)
+
+    by_day = {i: [] for i in range(7)}
+    for _, dow, start, end, label, location, commute_min in study_blocks:
+        # Expand the block by commute time on each side
+        s_min = max(DAY_START_MIN, hhmm_to_min(start) - commute_min)
+        e_min = min(DAY_END_MIN,   hhmm_to_min(end)   + commute_min)
+        by_day[dow].append({
+            "start": min_to_hhmm(s_min), "end": min_to_hhmm(e_min),
+            "type": "study", "label": label,
+        })
+    for _, dow, start, end, label, completed, location, commute_min in workouts:
+        s_min = max(DAY_START_MIN, hhmm_to_min(start) - commute_min)
+        e_min = min(DAY_END_MIN,   hhmm_to_min(end)   + commute_min)
+        by_day[dow].append({
+            "start": min_to_hhmm(s_min), "end": min_to_hhmm(e_min),
+            "type": "workout", "label": label,
+        })
+    for sess in task_sessions:
+        by_day[sess["day_of_week"]].append({
+            "start": sess["start_time"],
+            "end":   sess["end_time"],
+            "type":  "task_session",
+            "label": sess["title"],
+        })
+
+    for dow in by_day:
+        by_day[dow].sort(key=lambda x: hhmm_to_min(x["start"]))
+
+    return by_day
+
+
+def _free_slots(day_events: list, buffer: int,
+                day_start: int = DAY_START_MIN,
+                day_end: int   = DAY_END_MIN) -> list:
+    """
+    Given a sorted list of events for one day, return free (start, end) windows
+    in minutes, respecting buffer on each side of existing events.
+    """
+    slots = []
+    current = day_start
+
+    for ev in day_events:
+        ev_start = hhmm_to_min(ev["start"])
+        ev_end   = hhmm_to_min(ev["end"])
+
+        free_start = current + buffer
+        free_end   = ev_start - buffer
+
+        if free_end > free_start:
+            slots.append((free_start, free_end))
+
+        current = max(current, ev_end)
+
+    # slot after the last event
+    free_start = current + buffer
+    if day_end > free_start:
+        slots.append((free_start, day_end))
+
+    return slots
+
+
+# ── Preferred-time window ─────────────────────────────────────────────────────
+
+TIME_RANGES = {
+    "morning":   (8  * 60, 12 * 60),
+    "afternoon": (12 * 60, 17 * 60),
+    "evening":   (17 * 60, 22 * 60),
+    "any":       (8  * 60, 22 * 60),
+}
+
+
+def _clip(slot_start, slot_end, window_start, window_end):
+    """Clip a free slot to the preferred time window."""
+    s = max(slot_start, window_start)
+    e = min(slot_end,   window_end)
+    return (s, e) if e > s else None
+
+
+# ── Workout recommendations ────────────────────────────────────────────────────
+
+def recommend_workouts(user_id: int) -> list:
+    """
+    Return up to workouts_per_week*2 suggested workout slots, sorted by
+    how well they fit the user's preferred time.
+    """
+    prefs = get_preferences(user_id)
+    if not prefs:
+        return []
+
+    workouts_per_week, duration, preferred_time, buffer, *_ = prefs
+    events_by_day = get_all_events_by_day(user_id)
+
+    pref_start, pref_end = TIME_RANGES.get(preferred_time, (DAY_START_MIN, DAY_END_MIN))
+
+    # Build a set of days that already have a confirmed workout
+    days_with_workout = {
+        dow for dow, events in events_by_day.items()
+        if any(e["type"] == "workout" for e in events)
+    }
+
+    recommendations = []
+
+    for dow in range(7):
+        # Skip days that already have a confirmed workout
+        if dow in days_with_workout:
+            continue
+
+        day_events = sorted(events_by_day[dow], key=lambda x: hhmm_to_min(x["start"]))
+        free = _free_slots(day_events, buffer)
+
+        for slot_s, slot_e in free:
+            clipped = _clip(slot_s, slot_e, pref_start, pref_end)
+            if not clipped:
+                continue
+            cs, ce = clipped
+            if ce - cs < duration:
+                continue
+
+            # Score: prefer centre of preferred window, penalise early/late extremes
+            mid       = (cs + ce) / 2
+            pref_mid  = (pref_start + pref_end) / 2
+            score     = 100 - abs(mid - pref_mid) / 6   # ~10 points per hour off-centre
+
+            recommendations.append({
+                "day_of_week": dow,
+                "start_time":  min_to_hhmm(cs),
+                "end_time":    min_to_hhmm(cs + duration),
+                "score":       round(score, 1),
+            })
+
+    recommendations.sort(key=lambda x: x["score"], reverse=True)
+    return recommendations[: workouts_per_week * 2]
+
+
+# ── Task-session recommendations ───────────────────────────────────────────────
+
+def recommend_task_sessions(user_id: int, focus_hours: float = 1.5) -> list:
+    """
+    Schedule study sessions for all pending tasks into free windows.
+
+    Smart heuristics:
+    - Never suggest a slot in the past (today's already-passed hours are blocked).
+    - Tasks due today are scheduled first and only into today's remaining hours.
+    - Tasks sorted by priority (high→low) then due date (soonest first).
+    - No more than MAX_TASK_MIN_PER_DAY of task work per day.
+    - Large tasks split into focus_hours chunks.
+    - Scheduled sessions locked in so later tasks don't double-book.
+    """
+    import datetime as _dt
+
+    tasks = get_tasks(user_id, status_filter="pending")
+    if not tasks:
+        return []
+
+    prefs  = get_preferences(user_id)
+    buffer = prefs[3] if prefs else 30
+
+    # ── Figure out today's dow and current time in minutes ─────────────
+    now         = _dt.datetime.now()
+    today       = now.date()
+    today_dow   = (now.weekday() + 1) % 7          # Sun=0 … Sat=6
+    now_min     = now.hour * 60 + now.minute        # minutes since midnight
+
+    # ── Map due_date string → dow of that day this week ────────────────
+    week_start = today - _dt.timedelta(days=today_dow)  # this Sunday
+
+    def due_dow(due_str: str):
+        """Return the day-of-week index if due_str falls within this week, else None."""
+        if not due_str:
+            return None
+        try:
+            d = _dt.date.fromisoformat(due_str)
+            delta = (d - week_start).days
+            if 0 <= delta <= 6:
+                return delta
+        except ValueError:
+            pass
+        return None
+
+    # ── Sort: priority then due date ────────────────────────────────────
+    prio_rank = {"high": 0, "medium": 1, "low": 2}
+
+    def task_key(t):
+        return (prio_rank[t["priority"]], t["due_date"] or "9999-12-31")
+
+    tasks.sort(key=task_key)
+
+    # ── Mutable schedule ────────────────────────────────────────────────
+    events_by_day   = get_all_events_by_day(user_id)
+    day_task_min    = {i: 0 for i in range(7)}
+    focus_min       = int(focus_hours * 60)
+    MIN_SESSION_MIN = 30
+
+    scheduled = []
+
+    for task in tasks:
+        remaining_min = int(task["estimated_hours"] * 60)
+        task_due_dow  = due_dow(task.get("due_date", ""))
+
+        # Build the day-order to try: due day first (if this week), then all days
+        if task_due_dow is not None:
+            day_order = [task_due_dow] + [d for d in range(7) if d != task_due_dow]
+        else:
+            day_order = list(range(7))
+
+        for dow in day_order:
+            if remaining_min <= 0:
+                break
+            if day_task_min[dow] >= MAX_TASK_MIN_PER_DAY:
+                continue
+
+            day_events = sorted(events_by_day[dow], key=lambda x: hhmm_to_min(x["start"]))
+            free_slots = _free_slots(day_events, buffer)
+
+            for slot_s, slot_e in free_slots:
+                if remaining_min <= 0:
+                    break
+
+                # ── Block past slots on today ───────────────────────────
+                if dow == today_dow:
+                    # push slot start to at least now + 15 min buffer
+                    slot_s = max(slot_s, now_min + 15)
+                    if slot_s >= slot_e:
+                        continue
+
+                available_in_slot = slot_e - slot_s
+                available_today   = MAX_TASK_MIN_PER_DAY - day_task_min[dow]
+
+                session_min = min(focus_min, remaining_min,
+                                  available_in_slot, available_today)
+
+                if session_min < MIN_SESSION_MIN:
+                    continue
+
+                sess_end = slot_s + session_min
+
+                # Safety guard: skip malformed sessions
+                if sess_end <= slot_s or sess_end > DAY_END_MIN:
+                    continue
+
+                scheduled.append({
+                    "day_of_week": dow,
+                    "start_time":  min_to_hhmm(slot_s),
+                    "end_time":    min_to_hhmm(sess_end),
+                    "task_id":     task["id"],
+                    "task_title":  task["title"],
+                    "priority":    task["priority"],
+                    "type":        "task_session",
+                })
+
+                events_by_day[dow].append({
+                    "start": min_to_hhmm(slot_s),
+                    "end":   min_to_hhmm(sess_end),
+                    "type":  "task_session",
+                    "label": task["title"],
+                })
+                events_by_day[dow].sort(key=lambda x: hhmm_to_min(x["start"]))
+
+                remaining_min     -= session_min
+                day_task_min[dow] += session_min
+
+    return scheduled
+
+
+# ── Per-task slot suggestions (for user to choose from) ───────────────────────
+
+def suggest_slots_for_task(user_id: int, task: dict,
+                            n_suggestions: int = 3,
+                            focus_hours: float = 1.5) -> dict:
+    """
+    Return suggested time slots only before the due date, plus a warning
+    if there isn't enough free time to complete the task.
+
+    Returns:
+      {
+        "suggestions":         list of slot dicts,
+        "warning":             str | None,
+        "total_available_min": int,
+        "needed_min":          int,
+      }
+    """
+    import datetime as _dt
+
+    prefs  = get_preferences(user_id)
+    buffer = prefs[3] if prefs else 30
+
+    now       = _dt.datetime.now()
+    today_dow = (now.weekday() + 1) % 7
+    now_min   = now.hour * 60 + now.minute
+
+    events_by_day = get_all_events_by_day(user_id)
+    focus_min  = int(focus_hours * 60)
+    needed_min = int(task["estimated_hours"] * 60)
+    session_min = min(focus_min, needed_min) if needed_min >= 30 else max(needed_min, 30)
+
+    # ── Valid day range: today → due day ───────────────────────────────
+    week_start  = now.date() - _dt.timedelta(days=today_dow)
+    due_str     = task.get("due_date")
+    due_dow_idx = None
+
+    if due_str:
+        try:
+            d     = _dt.date.fromisoformat(due_str)
+            delta = (d - week_start).days
+            if 0 <= delta <= 6:
+                due_dow_idx = delta
+        except ValueError:
+            pass
+
+    if due_dow_idx is not None:
+        day_order = list(range(today_dow, due_dow_idx + 1)) or [today_dow]
+    else:
+        day_order = list(range(today_dow, 7))
+
+    # ── Scan all free time in the window ──────────────────────────────
+    total_available_min = 0
+    suggestions         = []
+
+    for dow in day_order:
+        day_events = sorted(events_by_day[dow], key=lambda x: hhmm_to_min(x["start"]))
+        free_slots = _free_slots(day_events, buffer)
+
+        for slot_s, slot_e in free_slots:
+            if dow == today_dow:
+                slot_s = max(slot_s, now_min + 15)
+                if slot_s >= slot_e:
+                    continue
+
+            avail = slot_e - slot_s
+            if avail >= 30:
+                total_available_min += avail
+
+            if len(suggestions) < n_suggestions and avail >= session_min:
+                suggestions.append({
+                    "day_of_week": dow,
+                    "day_name":    DAYS[dow],
+                    "start_time":  min_to_hhmm(slot_s),
+                    "end_time":    min_to_hhmm(slot_s + session_min),
+                })
+
+    # ── Warning if not enough time ─────────────────────────────────────
+    warning = None
+    if total_available_min < needed_min:
+        free_h = round(total_available_min / 60, 1)
+        need_h = round(needed_min / 60, 1)
+        if due_dow_idx is not None:
+            due_label = DAYS[due_dow_idx]
+            warning = (
+                f"Not enough time before the deadline! "
+                f"You need **{need_h}h** but only **{free_h}h** free before {due_label}. "
+                f"Consider reducing the task scope or moving the deadline."
+            )
+        else:
+            warning = (
+                f"Only **{free_h}h** free this week, but the task needs **{need_h}h**. "
+                f"Consider splitting it across next week too."
+            )
+
+    return {
+        "suggestions":         suggestions,
+        "warning":             warning,
+        "total_available_min": total_available_min,
+        "needed_min":          needed_min,
+    }
+
+
+# ── Overloaded-day detection ───────────────────────────────────────────────────
+
+def detect_overloaded_days(user_id: int, threshold_hours: float = 6.0) -> list:
+    """
+    Return list of day indices (0=Sunday…6=Saturday) where total committed
+    time (study + workouts + scheduled tasks) exceeds threshold_hours.
+    """
+    events_by_day = get_all_events_by_day(user_id)
+    overloaded = []
+
+    for dow, events in events_by_day.items():
+        total_min = sum(
+            hhmm_to_min(e["end"]) - hhmm_to_min(e["start"])
+            for e in events
+        )
+        if total_min >= threshold_hours * 60:
+            overloaded.append(dow)
+
+    return overloaded
+
+
+# ── Combined week plan ─────────────────────────────────────────────────────────
+
+def get_week_plan(user_id: int, focus_hours: float = 1.5) -> dict:
+    """
+    Returns a dict with:
+      'workouts'      – workout slot recommendations
+      'task_sessions' – task-session recommendations
+      'overloaded'    – list of overloaded day indices
+    """
+    return {
+        "workouts":      recommend_workouts(user_id),
+        "task_sessions": recommend_task_sessions(user_id, focus_hours),
+        "overloaded":    detect_overloaded_days(user_id),
+    }

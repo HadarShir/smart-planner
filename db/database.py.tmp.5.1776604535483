@@ -1,0 +1,300 @@
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path("smart_planner.db")
+
+
+def get_connection():
+    """
+    יוצר חיבור ל-Database
+    """
+    conn = sqlite3.connect(DB_PATH)
+    return conn
+
+
+def create_user(name: str):
+    """
+    מוסיף משתמש חדש לטבלת users
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "INSERT INTO users (name) VALUES (?)",
+        (name,)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_all_users():
+    """
+    מחזיר את כל המשתמשים
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id, name FROM users")
+
+    users = cursor.fetchall()
+
+    conn.close()
+
+    return users
+
+def save_preferences(user_id: int,
+                     workouts_per_week: int,
+                     workout_duration_min: int,
+                     preferred_time: str,
+                     buffer_min: int):
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    INSERT OR REPLACE INTO preferences
+    (user_id, workouts_per_week, workout_duration_min, preferred_time, buffer_min)
+    VALUES (?, ?, ?, ?, ?)
+    """, (user_id,
+          workouts_per_week,
+          workout_duration_min,
+          preferred_time,
+          buffer_min))
+
+    conn.commit()
+    conn.close()
+
+def add_study_block(user_id: int, day_of_week: int, start_time: str, end_time: str, label: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    INSERT INTO study_blocks (user_id, day_of_week, start_time, end_time, label)
+    VALUES (?, ?, ?, ?, ?)
+    """, (user_id, day_of_week, start_time, end_time, label))
+
+    conn.commit()
+    conn.close()
+
+
+def get_study_blocks(user_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    SELECT id, day_of_week, start_time, end_time, label
+    FROM study_blocks
+    WHERE user_id = ?
+    ORDER BY day_of_week, start_time
+    """, (user_id,))
+
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def get_preferences(user_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    SELECT workouts_per_week, workout_duration_min, preferred_time, buffer_min
+    FROM preferences
+    WHERE user_id = ?
+    """, (user_id,))
+
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
+def add_workout(user_id: int, day_of_week: int, start_time: str, end_time: str, label: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    INSERT INTO workouts (user_id, day_of_week, start_time, end_time, label)
+    VALUES (?, ?, ?, ?, ?)
+    """, (user_id, day_of_week, start_time, end_time, label))
+
+    conn.commit()
+    conn.close()
+
+
+def get_workouts(user_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    SELECT id, day_of_week, start_time, end_time, label
+    FROM workouts
+    WHERE user_id = ?
+    ORDER BY day_of_week, start_time
+    """, (user_id,))
+
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def delete_workout(workout_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM workouts WHERE id = ?", (workout_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_study_block(block_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM study_blocks WHERE id = ?", (block_id,))
+    conn.commit()
+    conn.close()
+
+def update_study_block(block_id: int, day_of_week: int, start_time: str, end_time: str, label: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    UPDATE study_blocks
+    SET day_of_week = ?, start_time = ?, end_time = ?, label = ?
+    WHERE id = ?
+    """, (day_of_week, start_time, end_time, label, block_id))
+
+    conn.commit()
+    conn.close()
+
+
+# ── Tasks ──────────────────────────────────────────────────────────────────────
+
+def add_task(user_id: int, title: str, description: str,
+             due_date: str, priority: str, estimated_hours: float):
+    """Insert a new task and return its new id."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO tasks (user_id, title, description, due_date, priority, status, estimated_hours)
+    VALUES (?, ?, ?, ?, ?, 'pending', ?)
+    """, (user_id, title, description, due_date, priority, estimated_hours))
+    task_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return task_id
+
+
+def get_tasks(user_id: int, status_filter: str = None):
+    """
+    Return tasks for a user.
+    status_filter: 'pending' | 'done' | None (all)
+    Returns list of dicts with keys: id, title, description, due_date,
+                                      priority, status, estimated_hours
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    if status_filter:
+        cursor.execute("""
+        SELECT id, title, description, due_date, priority, status, estimated_hours
+        FROM tasks
+        WHERE user_id = ? AND status = ?
+        ORDER BY
+            CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+            due_date ASC
+        """, (user_id, status_filter))
+    else:
+        cursor.execute("""
+        SELECT id, title, description, due_date, priority, status, estimated_hours
+        FROM tasks
+        WHERE user_id = ?
+        ORDER BY
+            CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+            due_date ASC
+        """, (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    cols = ["id", "title", "description", "due_date", "priority", "status", "estimated_hours"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def update_task_status(task_id: int, status: str):
+    """Mark a task as 'pending' or 'done'."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    conn.commit()
+    conn.close()
+
+
+def update_task(task_id: int, title: str, description: str,
+                due_date: str, priority: str, estimated_hours: float):
+    """Edit all fields of an existing task."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE tasks
+    SET title = ?, description = ?, due_date = ?, priority = ?, estimated_hours = ?
+    WHERE id = ?
+    """, (title, description, due_date, priority, estimated_hours, task_id))
+    conn.commit()
+    conn.close()
+
+
+def add_task_session(user_id: int, task_id: int, day_of_week: int,
+                     start_time: str, end_time: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO task_sessions (user_id, task_id, day_of_week, start_time, end_time)
+    VALUES (?, ?, ?, ?, ?)
+    """, (user_id, task_id, day_of_week, start_time, end_time))
+    conn.commit()
+    conn.close()
+
+
+def get_task_sessions(user_id: int):
+    """Return all accepted task sessions for a user."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT ts.id, ts.task_id, t.title, t.priority, ts.day_of_week, ts.start_time, ts.end_time
+    FROM task_sessions ts
+    JOIN tasks t ON ts.task_id = t.id
+    WHERE ts.user_id = ?
+    ORDER BY ts.day_of_week, ts.start_time
+    """, (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    cols = ["id", "task_id", "title", "priority", "day_of_week", "start_time", "end_time"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def delete_task_session(session_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM task_sessions WHERE id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+
+
+def update_workout(workout_id: int, day_of_week: int, start_time: str, end_time: str, label: str):
+    """Update an existing workout's day and time (used after drag-and-drop)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE workouts
+    SET day_of_week = ?, start_time = ?, end_time = ?, label = ?
+    WHERE id = ?
+    """, (day_of_week, start_time, end_time, label, workout_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_task(task_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    conn.commit()
+    conn.close()
